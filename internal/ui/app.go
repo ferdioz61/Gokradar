@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -55,6 +56,7 @@ func (a altFilter) Label() string {
 
 // Messages
 type tickMsg time.Time
+type animTickMsg time.Time
 
 type globalDataMsg struct {
 	flights []model.Flight
@@ -91,8 +93,27 @@ type AppModel struct {
 	focus      focusArea
 	fullscreen bool
 	showHelp   bool
+	showStats  bool
 	ascii      bool
 	metric     bool
+
+	// Visual & radar layer modes
+	labelMode   LabelMode
+	trailMode   TrailMode
+	showRings   bool
+	showVectors bool
+	followMode  bool
+	paused      bool
+	themeIdx    int
+
+	// Mouse interaction state
+	dragging      bool
+	dragLastX     int
+	dragLastY     int
+	dragMoved     bool
+	lastClickTime time.Time
+	lastClickX    int
+	lastClickY    int
 
 	// Raw aircraft store keyed by ICAO24 hex
 	flightsByHex map[string]model.Flight
@@ -138,22 +159,33 @@ func NewAppModel(world *data.WorldData, opts Options) AppModel {
 	}
 
 	return AppModel{
-		width:        120,
-		height:       34,
-		world:        world,
-		client:       &http.Client{Timeout: 18 * time.Second},
-		routes:       data.NewRouteCache(),
-		watchlist:    config.LoadWatchlist(),
-		vp:           vp,
-		focus:        focusList,
-		ascii:        opts.ASCII,
-		metric:       opts.Metric,
-		flightsByHex: make(map[string]model.Flight, 12000),
-		trails:       make(map[string][]model.Point, 4096),
+		width:         120,
+		height:        34,
+		world:         world,
+		client:        &http.Client{Timeout: 18 * time.Second},
+		routes:        data.NewRouteCache(),
+		watchlist:     config.LoadWatchlist(),
+		vp:            vp,
+		focus:         focusList,
+		ascii:         opts.ASCII,
+		metric:        opts.Metric,
+		labelMode:     LabelSmart,
+		trailMode:     TrailSelected,
+		showRings:     false,
+		showVectors:   true,
+		flightsByHex:  make(map[string]model.Flight, 12000),
+		trails:        make(map[string][]model.Point, 4096),
 		loadingGlobal: true,
-		statusMsg:    "Dünya geneli uçuş verileri yükleniyor...",
-		sourceLabel:  "Yükleniyor",
+		statusMsg:     "Dünya geneli uçuş verileri yükleniyor...",
+		sourceLabel:   "Yükleniyor",
 	}
+}
+
+func (m AppModel) activeTheme() Theme {
+	if m.themeIdx >= 0 && m.themeIdx < len(Themes) {
+		return Themes[m.themeIdx]
+	}
+	return Themes[0]
 }
 
 func (m AppModel) Init() tea.Cmd {
@@ -162,12 +194,19 @@ func (m AppModel) Init() tea.Cmd {
 		m.fetchMilCmd(),
 		m.fetchRegionalCmd(),
 		tickCmd(),
+		animTickCmd(),
 	)
 }
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(15*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
+	})
+}
+
+func animTickCmd() tea.Cmd {
+	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+		return animTickMsg(t)
 	})
 }
 
@@ -194,7 +233,6 @@ func (m AppModel) fetchMilCmd() tea.Cmd {
 func (m AppModel) fetchRegionalCmd() tea.Cmd {
 	client := m.client
 	lat, lon := m.vp.CenterLat, m.vp.CenterLon
-	// If viewing whole world, enrich Turkey region by default; otherwise enrich viewport center
 	if m.vp.SpanLon > 120 {
 		lat, lon = 39.0, 35.0
 	}
@@ -235,6 +273,16 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loadingGlobal = true
 		return m, tea.Batch(cmds...)
 
+	case animTickMsg:
+		if !m.paused && len(m.flightsByHex) > 0 {
+			m.advanceDeadReckoning(2.0)
+			if m.followMode {
+				m.syncFollowCamera()
+			}
+			m.rebuildFiltered()
+		}
+		return m, animTickCmd()
+
 	case globalDataMsg:
 		m.loadingGlobal = false
 		if msg.err != nil {
@@ -246,6 +294,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sourceLabel = "OpenSky+ADSB"
 			m.statusMsg = fmt.Sprintf("Güncellendi (%s) — %d aktif uçak", m.lastUpdate.Format("15:04:05"), len(m.flightsByHex))
 		}
+		if m.followMode {
+			m.syncFollowCamera()
+		}
 		m.rebuildFiltered()
 		return m, m.maybeFetchSelectedRoute()
 
@@ -256,6 +307,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.sourceLabel == "Yükleniyor" {
 				m.sourceLabel = "ADSB.lol"
 			}
+			if m.followMode {
+				m.syncFollowCamera()
+			}
 			m.rebuildFiltered()
 			return m, m.maybeFetchSelectedRoute()
 		}
@@ -265,6 +319,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err == nil {
 			m.milCount = len(msg.flights)
 			m.mergeFlights(msg.flights, false)
+			if m.followMode {
+				m.syncFollowCamera()
+			}
 			m.rebuildFiltered()
 			return m, m.maybeFetchSelectedRoute()
 		}
@@ -279,11 +336,38 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
 
 	return m, nil
+}
+
+// advanceDeadReckoning smoothly interpolates airborne aircraft positions between API refreshes.
+func (m *AppModel) advanceDeadReckoning(dtSec float64) {
+	for hex, f := range m.flightsByHex {
+		if f.OnGround || f.SpeedKt < 30 {
+			continue
+		}
+		nLat, nLon := geo.ProjectPoint(f.Lat, f.Lon, f.SpeedKt, f.TrackDeg, dtSec)
+		f.Lat = nLat
+		f.Lon = nLon
+		m.flightsByHex[hex] = f
+	}
+}
+
+func (m *AppModel) syncFollowCamera() {
+	if m.selectedHex == "" {
+		return
+	}
+	if f, ok := m.flightsByHex[m.selectedHex]; ok {
+		m.vp.CenterLat = f.Lat
+		m.vp.CenterLon = f.Lon
+		m.vp.Name = "KİLİT:" + f.DisplayID()
+	}
 }
 
 func (m *AppModel) mergeFlights(incoming []model.Flight, pruneOldOpenSky bool) {
@@ -299,7 +383,6 @@ func (m *AppModel) mergeFlights(incoming []model.Flight, pruneOldOpenSky bool) {
 
 	for _, f := range incoming {
 		if existing, ok := m.flightsByHex[f.Hex]; ok {
-			// Preserve richer fields when merging OpenSky with adsb.lol
 			if f.Registration == "" {
 				f.Registration = existing.Registration
 			}
@@ -321,17 +404,17 @@ func (m *AppModel) mergeFlights(incoming []model.Flight, pruneOldOpenSky bool) {
 		}
 		m.flightsByHex[f.Hex] = f
 
-		// Append to trail if moved noticeably
+		// Append to altitude-tagged trail if moved noticeably
 		tr := m.trails[f.Hex]
-		pt := model.Point{Lat: f.Lat, Lon: f.Lon}
+		pt := model.Point{Lat: f.Lat, Lon: f.Lon, AltFeet: f.AltFeet}
 		if len(tr) == 0 {
 			m.trails[f.Hex] = []model.Point{pt}
 		} else {
 			last := tr[len(tr)-1]
 			if (last.Lat-pt.Lat)*(last.Lat-pt.Lat)+(last.Lon-pt.Lon)*(last.Lon-pt.Lon) > 0.0001 {
 				tr = append(tr, pt)
-				if len(tr) > 30 {
-					tr = tr[len(tr)-30:]
+				if len(tr) > 120 {
+					tr = tr[len(tr)-120:]
 				}
 				m.trails[f.Hex] = tr
 			}
@@ -340,7 +423,6 @@ func (m *AppModel) mergeFlights(incoming []model.Flight, pruneOldOpenSky bool) {
 }
 
 func (m *AppModel) mapDimensions() (mapW, mapH, listW int) {
-	// Reserve 5 lines for detail panel (3 lines + top/bottom border) + 1 top status bar
 	bodyH := m.height - 7
 	if bodyH < 6 {
 		bodyH = 6
@@ -359,6 +441,243 @@ func (m *AppModel) mapDimensions() (mapW, mapH, listW int) {
 	return mapW, bodyH, listW
 }
 
+// FindNearestFlightAt returns the index in flights closest to terminal map cell (cx, cy) within maxDistCells.
+func FindNearestFlightAt(flights []model.Flight, vp geo.Viewport, mapW, mapH, cx, cy int, maxDistCells float64) int {
+	bestIdx := -1
+	bestDist := maxDistCells + 0.001
+	fw, fh := float64(mapW-1), float64(mapH-1)
+	for i := range flights {
+		x, y, vis := vp.Project(flights[i].Lat, flights[i].Lon, mapW, mapH, fw, fh)
+		if !vis {
+			continue
+		}
+		// Weight vertical distance slightly more because terminal cells are ~2x taller than wide
+		dx := x - float64(cx)
+		dy := (y - float64(cy)) * 1.4
+		d := math.Hypot(dx, dy)
+		if d < bestDist {
+			bestDist = d
+			bestIdx = i
+		}
+	}
+	return bestIdx
+}
+
+func (m AppModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	// Close modals on click
+	if m.showHelp || m.showStats {
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			m.showHelp = false
+			m.showStats = false
+		}
+		return m, nil
+	}
+
+	mapW, mapH, listW := m.mapDimensions()
+	// Layout geometry:
+	// Row 0: header bar
+	// Row 1: top border of mapBox & listBox
+	// Rows 2..mapH+1: inner content of mapBox (cols 1..mapW) and listBox (cols mapW+3..mapW+2+listW)
+	inMap := msg.X >= 1 && msg.X <= mapW && msg.Y >= 2 && msg.Y <= mapH+1
+	inList := listW > 0 && msg.X >= mapW+3 && msg.X <= mapW+2+listW && msg.Y >= 2 && msg.Y <= mapH+1
+
+	switch {
+	// Wheel scroll
+	case msg.Button == tea.MouseButtonWheelUp:
+		if inMap {
+			m.focus = focusMap
+			cx := float64(msg.X - 1)
+			cy := float64(msg.Y - 2)
+			m.vp.ZoomAt(0.75, cx, cy, mapW, mapH)
+			m.rebuildFiltered()
+			if m.vp.SpanLon < 40 {
+				return m, m.fetchRegionalCmd()
+			}
+			return m, nil
+		}
+		if inList && len(m.filtered) > 0 {
+			m.focus = focusList
+			m.cursor -= 3
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
+			m.selectedHex = m.filtered[m.cursor].Hex
+			return m, m.maybeFetchSelectedRoute()
+		}
+		return m, nil
+
+	case msg.Button == tea.MouseButtonWheelDown:
+		if inMap {
+			m.focus = focusMap
+			cx := float64(msg.X - 1)
+			cy := float64(msg.Y - 2)
+			m.vp.ZoomAt(1.33, cx, cy, mapW, mapH)
+			m.rebuildFiltered()
+			return m, nil
+		}
+		if inList && len(m.filtered) > 0 {
+			m.focus = focusList
+			m.cursor += 3
+			if m.cursor >= len(m.filtered) {
+				m.cursor = len(m.filtered) - 1
+			}
+			m.selectedHex = m.filtered[m.cursor].Hex
+			return m, m.maybeFetchSelectedRoute()
+		}
+		return m, nil
+
+	// Right click on map: toggle follow lock on aircraft, or center map on clicked point
+	case msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonRight:
+		if inMap {
+			m.focus = focusMap
+			cx := msg.X - 1
+			cy := msg.Y - 2
+			idx := FindNearestFlightAt(m.filtered, m.vp, mapW, mapH, cx, cy, 3.0)
+			if idx >= 0 {
+				m.cursor = idx
+				m.selectedHex = m.filtered[idx].Hex
+				m.followMode = !m.followMode
+				if m.followMode {
+					m.syncFollowCamera()
+					if m.vp.SpanLon > 24 {
+						m.vp.SpanLon = 16
+					}
+					m.statusMsg = m.filtered[idx].DisplayID() + " canlı takip kilidine alındı"
+				} else {
+					m.vp.Name = "ÖZEL"
+					m.statusMsg = "Canlı takip kilidi kapatıldı"
+				}
+				m.rebuildFiltered()
+				return m, tea.Batch(m.fetchRegionalCmd(), m.maybeFetchSelectedRoute())
+			}
+			lat, lon := m.vp.Unproject(float64(cx), float64(cy), mapW, mapH)
+			m.followMode = false
+			m.vp.CenterLat = lat
+			m.vp.CenterLon = lon
+			m.vp.Name = "ÖZEL"
+			m.rebuildFiltered()
+			return m, m.fetchRegionalCmd()
+		}
+		return m, nil
+
+	// Left button press: start drag (in map) or select row (in list)
+	case msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft:
+		now := time.Now()
+		isDouble := now.Sub(m.lastClickTime) < 420*time.Millisecond &&
+			absInt(msg.X-m.lastClickX) <= 2 && absInt(msg.Y-m.lastClickY) <= 1
+		m.lastClickTime = now
+		m.lastClickX = msg.X
+		m.lastClickY = msg.Y
+
+		if inMap {
+			m.focus = focusMap
+			m.dragging = true
+			m.dragLastX = msg.X
+			m.dragLastY = msg.Y
+			m.dragMoved = false
+			if isDouble {
+				m.dragging = false
+				cx := msg.X - 1
+				cy := msg.Y - 2
+				idx := FindNearestFlightAt(m.filtered, m.vp, mapW, mapH, cx, cy, 3.2)
+				if idx >= 0 {
+					m.cursor = idx
+					m.selectedHex = m.filtered[idx].Hex
+					m.followMode = true
+					m.syncFollowCamera()
+					if m.vp.SpanLon > 22 {
+						m.vp.SpanLon = 14
+					}
+					m.statusMsg = m.filtered[idx].DisplayID() + " canlı takip kilidine alındı"
+					m.rebuildFiltered()
+					return m, tea.Batch(m.fetchRegionalCmd(), m.maybeFetchSelectedRoute())
+				}
+				// Double-click empty map: center & zoom in
+				m.followMode = false
+				m.vp.ZoomAt(0.55, float64(cx), float64(cy), mapW, mapH)
+				m.rebuildFiltered()
+				return m, m.fetchRegionalCmd()
+			}
+			return m, nil
+		}
+
+		if inList && len(m.filtered) > 0 {
+			m.focus = focusList
+			// First 2 rows inside listBox are title and column header
+			relRow := (msg.Y - 2) - 2
+			rowsAvail := mapH - 2
+			if relRow >= 0 && relRow < rowsAvail {
+				start, end := ListScrollWindow(len(m.filtered), m.cursor, rowsAvail)
+				idx := start + relRow
+				if idx >= start && idx < end {
+					m.cursor = idx
+					m.selectedHex = m.filtered[idx].Hex
+					if isDouble {
+						m.followMode = true
+						m.syncFollowCamera()
+						if m.vp.SpanLon > 24 {
+							m.vp.SpanLon = 16
+						}
+						m.rebuildFiltered()
+						return m, tea.Batch(m.fetchRegionalCmd(), m.maybeFetchSelectedRoute())
+					}
+					return m, m.maybeFetchSelectedRoute()
+				}
+			}
+		}
+		return m, nil
+
+	// Mouse drag motion
+	case msg.Action == tea.MouseActionMotion && m.dragging:
+		dx := msg.X - m.dragLastX
+		dy := msg.Y - m.dragLastY
+		if dx != 0 || dy != 0 {
+			m.dragLastX = msg.X
+			m.dragLastY = msg.Y
+			m.dragMoved = true
+			m.followMode = false
+			m.vp.PanByCells(dx, dy, mapW, mapH)
+			m.rebuildFiltered()
+		}
+		return m, nil
+
+	// Mouse release
+	case msg.Action == tea.MouseActionRelease:
+		if m.dragging {
+			wasMoved := m.dragMoved
+			m.dragging = false
+			m.dragMoved = false
+			if wasMoved {
+				if m.vp.SpanLon < 55 {
+					return m, m.fetchRegionalCmd()
+				}
+				return m, nil
+			}
+			// Simple click without drag -> select nearest aircraft
+			if inMap {
+				cx := msg.X - 1
+				cy := msg.Y - 2
+				idx := FindNearestFlightAt(m.filtered, m.vp, mapW, mapH, cx, cy, 3.2)
+				if idx >= 0 {
+					m.cursor = idx
+					m.selectedHex = m.filtered[idx].Hex
+					return m, m.maybeFetchSelectedRoute()
+				}
+			}
+		}
+		return m, nil
+	}
+
+	return m, nil
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
 func (m *AppModel) rebuildFiltered() {
 	mapW, mapH, _ := m.mapDimensions()
 	minLat, maxLat, minLon, maxLon := m.vp.Bounds(mapW, mapH)
@@ -366,7 +685,6 @@ func (m *AppModel) rebuildFiltered() {
 
 	res := make([]model.Flight, 0, 512)
 	for _, f := range m.flightsByHex {
-		// Viewport filter (unless user is actively searching globally)
 		if q == "" {
 			if f.Lat < minLat || f.Lat > maxLat || f.Lon < minLon || f.Lon > maxLon {
 				continue
@@ -429,7 +747,6 @@ func (m *AppModel) rebuildFiltered() {
 		if fi.IsMilitary != fj.IsMilitary {
 			return fi.IsMilitary
 		}
-		// Prefer flights closer to viewport center
 		di := (fi.Lat-cLat)*(fi.Lat-cLat) + (fi.Lon-cLon)*(fi.Lon-cLon)
 		dj := (fj.Lat-cLat)*(fj.Lat-cLat) + (fj.Lon-cLon)*(fj.Lon-cLon)
 		if di != dj {
@@ -440,7 +757,6 @@ func (m *AppModel) rebuildFiltered() {
 
 	m.filtered = res
 
-	// Keep cursor synced to previously selected aircraft if still present
 	if m.selectedHex != "" {
 		found := false
 		for i, f := range m.filtered {
@@ -499,10 +815,16 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 
-	// Help overlay toggle
+	// Modals
 	if m.showHelp {
 		if key == "?" || key == "esc" || key == "q" || key == "enter" {
 			m.showHelp = false
+		}
+		return m, nil
+	}
+	if m.showStats {
+		if key == "i" || key == "esc" || key == "q" || key == "enter" {
+			m.showStats = false
 		}
 		return m, nil
 	}
@@ -551,6 +873,9 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		m.showHelp = true
 		return m, nil
+	case "i":
+		m.showStats = true
+		return m, nil
 	case "tab":
 		if m.focus == focusList {
 			m.focus = focusMap
@@ -565,6 +890,9 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.searchQuery != "" {
 			m.searchQuery = ""
 			m.rebuildFiltered()
+		} else if m.followMode {
+			m.followMode = false
+			m.vp.Name = "ÖZEL"
 		}
 		return m, nil
 	case "f":
@@ -576,6 +904,58 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "u":
 		m.metric = !m.metric
+		return m, nil
+	case "b":
+		m.labelMode = (m.labelMode + 1) % 3
+		m.statusMsg = "Etiket modu: " + m.labelMode.String()
+		return m, nil
+	case "t":
+		m.trailMode = (m.trailMode + 1) % 3
+		m.statusMsg = "İz modu: " + m.trailMode.String()
+		return m, nil
+	case "v":
+		m.showVectors = !m.showVectors
+		if m.showVectors {
+			m.statusMsg = "Hız/yön vektörleri açıldı"
+		} else {
+			m.statusMsg = "Hız/yön vektörleri kapatıldı"
+		}
+		return m, nil
+	case "g":
+		m.showRings = !m.showRings
+		if m.showRings {
+			m.statusMsg = "Radar mesafe halkaları açıldı"
+		} else {
+			m.statusMsg = "Radar mesafe halkaları kapatıldı"
+		}
+		return m, nil
+	case "p":
+		m.paused = !m.paused
+		if m.paused {
+			m.statusMsg = "Canlı süzülme animasyonu duraklatıldı"
+		} else {
+			m.statusMsg = "Canlı süzülme animasyonu devam ediyor"
+		}
+		return m, nil
+	case "T":
+		m.themeIdx = (m.themeIdx + 1) % len(Themes)
+		m.statusMsg = "Tema: " + m.activeTheme().Name
+		return m, nil
+	case "L":
+		if sel := m.selectedFlight(); sel != nil {
+			m.followMode = !m.followMode
+			if m.followMode {
+				m.syncFollowCamera()
+				if m.vp.SpanLon > 24 {
+					m.vp.SpanLon = 16
+				}
+				m.statusMsg = sel.DisplayID() + " canlı takip kilidine alındı"
+				m.rebuildFiltered()
+				return m, tea.Batch(m.fetchRegionalCmd(), m.maybeFetchSelectedRoute())
+			}
+			m.vp.Name = "ÖZEL"
+			m.statusMsg = "Canlı takip kilidi kapatıldı"
+		}
 		return m, nil
 	case "a":
 		m.altMode = (m.altMode + 1) % 4
@@ -634,6 +1014,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "1", "2", "3", "4", "5":
 		for _, p := range geo.Presets {
 			if p.Key == key {
+				m.followMode = false
 				m.vp = p.Viewport
 				m.rebuildFiltered()
 				return m, tea.Batch(m.fetchRegionalCmd(), m.maybeFetchSelectedRoute())
@@ -642,6 +1023,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "up", "k":
 		if m.focus == focusMap || m.fullscreen {
+			m.followMode = false
 			m.vp.Pan(0, 0.15, mapW, mapH)
 			m.rebuildFiltered()
 			return m, nil
@@ -654,6 +1036,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "down", "j":
 		if m.focus == focusMap || m.fullscreen {
+			m.followMode = false
 			m.vp.Pan(0, -0.15, mapW, mapH)
 			m.rebuildFiltered()
 			return m, nil
@@ -665,10 +1048,12 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "left", "h":
+		m.followMode = false
 		m.vp.Pan(-0.15, 0, mapW, mapH)
 		m.rebuildFiltered()
 		return m, nil
 	case "right", "l":
+		m.followMode = false
 		m.vp.Pan(0.15, 0, mapW, mapH)
 		m.rebuildFiltered()
 		return m, nil
@@ -702,8 +1087,13 @@ func (m AppModel) View() string {
 		return "GökRadar için terminal penceresini biraz büyütün (en az 30x12)."
 	}
 
+	theme := m.activeTheme()
+
 	if m.showHelp {
-		return m.renderHelp()
+		return m.renderHelp(theme)
+	}
+	if m.showStats {
+		return RenderStats(m.width, m.height, m.filtered, m.flightsByHex, m.metric, m.ascii, theme)
 	}
 
 	border := lipgloss.RoundedBorder()
@@ -722,13 +1112,12 @@ func (m AppModel) View() string {
 	if m.metric {
 		unitTag = "M/KM"
 	}
-	focusTag := "ODAK:LİSTE"
-	if m.focus == focusMap || m.fullscreen {
-		focusTag = "ODAK:HARİTA"
+	extraTags := ""
+	if m.paused {
+		extraTags += " [DURAKLATILDI]"
 	}
-	loadingTag := ""
 	if m.loadingGlobal {
-		loadingTag = " [Yükleniyor...]"
+		extraTags += " [Yükleniyor...]"
 	}
 
 	headerText := fmt.Sprintf(" GÖKRADAR [%s]  |  Görünür: %d / Toplam: %d  |  Askeri: %d  |  %s  |  %s  |  %s  |  %s%s",
@@ -739,13 +1128,10 @@ func (m AppModel) View() string {
 		m.sourceLabel,
 		modeTag,
 		unitTag,
-		focusTag,
-		loadingTag,
+		theme.Name,
+		extraTags,
 	)
-	headerBar := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("230")).
-		Background(lipgloss.Color("24")).
+	headerBar := theme.HeaderStyle.
 		Width(m.width).
 		Render(truncate(headerText, m.width))
 
@@ -775,11 +1161,19 @@ func (m AppModel) View() string {
 		selRoute,
 		m.trails,
 		m.watchlist.Has,
-		m.ascii,
+		MapRenderOptions{
+			ASCII:       m.ascii,
+			Metric:      m.metric,
+			LabelMode:   m.labelMode,
+			TrailMode:   m.trailMode,
+			ShowRings:   m.showRings,
+			ShowVectors: m.showVectors,
+			Theme:       theme,
+		},
 	)
-	mapBorderColor := lipgloss.Color("240")
+	mapBorderColor := theme.IdleBorder
 	if m.focus == focusMap || m.fullscreen {
-		mapBorderColor = lipgloss.Color("39")
+		mapBorderColor = theme.FocusBorder
 	}
 	mapBox := lipgloss.NewStyle().
 		Border(border).
@@ -812,10 +1206,11 @@ func (m AppModel) View() string {
 			m.searching,
 			m.searchQuery,
 			strings.Join(tags, ","),
+			theme,
 		)
-		listBorderColor := lipgloss.Color("240")
+		listBorderColor := theme.IdleBorder
 		if m.focus == focusList {
-			listBorderColor = lipgloss.Color("39")
+			listBorderColor = theme.FocusBorder
 		}
 		listBox := lipgloss.NewStyle().
 			Border(border).
@@ -829,49 +1224,50 @@ func (m AppModel) View() string {
 
 	// Bottom detail panel
 	detailW := m.width - 2
-	detailContent := RenderDetail(detailW, sel, selRoute, routeLoading, selFav, m.metric, m.statusMsg)
+	detailContent := RenderDetail(detailW, sel, selRoute, routeLoading, selFav, m.metric, m.ascii, m.statusMsg, theme)
 	detailBox := lipgloss.NewStyle().
 		Border(border).
-		BorderForeground(lipgloss.Color("240")).
+		BorderForeground(theme.IdleBorder).
 		Width(detailW).
 		Render(detailContent)
 
 	return lipgloss.JoinVertical(lipgloss.Left, headerBar, middle, detailBox)
 }
 
-func (m AppModel) renderHelp() string {
+func (m AppModel) renderHelp(theme Theme) string {
 	border := lipgloss.RoundedBorder()
 	if m.ascii {
 		border = lipgloss.ASCIIBorder()
 	}
 	helpText := strings.Join([]string{
-		"GÖKRADAR — KLAVYE KISAYOLLARI",
+		theme.DetailTitle.Render("GÖKRADAR — FARE & KLAVYE KISAYOLLARI"),
 		"",
-		"  1 / 2 / 3 / 4 / 5   : Hızlı Bölge (Dünya, Türkiye, Avrupa, Orta Doğu, ABD)",
+		theme.ListHeader.Render("  FARE KONTROLLERİ"),
+		"  Sol Tık + Sürükle   : Haritayı serbestçe kaydır",
+		"  Fare Tekerleği      : Haritada imleç odaklı yakınlaş/uzaklaş | Listede kaydır",
+		"  Sol Tık             : Haritada en yakın uçağı veya listeden satırı seç",
+		"  Çift Sol Tık        : Uçağa canlı takip kilidi aç | Boş alana yakınlaş",
+		"  Sağ Tık             : Uçağa takip kilidi aç/kapat | Boş noktayı ortala",
+		"",
+		theme.ListHeader.Render("  KLAVYE KISAYOLLARI"),
+		"  1 - 5               : Hızlı Bölge (Dünya, Türkiye, Avrupa, Orta Doğu, ABD)",
 		"  Tab                 : Odak değiştir (Liste ↔ Harita)",
-		"  ↑ / ↓ veya j / k    : Listede uçak seç / Haritada yukarı-aşağı kaydır",
-		"  ← / → veya h / l    : Haritayı sola-sağa kaydır",
-		"  + / -               : Haritayı yakınlaştır / uzaklaştır",
-		"  Enter veya c        : Seçili uçağı haritanın ortasına al ve yakınlaş",
-		"  f                   : Tam ekran harita modunu aç / kapat",
-		"  /                   : Ara (çağrı kodu, ülke, uçak tipi, havalimanı, havayolu)",
-		"  a                   : İrtifa filtresi (Tümü → >30k → 10k-30k → <10k)",
-		"  M                   : Sadece askeri uçuşları göster",
-		"  E                   : Sadece acil durum (7700 / 7600 / 7500) uçuşları",
-		"  s / S               : Seçili uçağı favorile / Sadece favorileri filtrele",
-		"  m                   : Braille ↔ ASCII harita modu (eski PowerShell için)",
-		"  u                   : Havacılık (ft/kt) ↔ Metrik (m/km/s) birimleri",
-		"  r                   : Verileri hemen yenile",
+		"  ↑↓←→ veya hjkl      : Listede uçak seç / Haritada gezin",
+		"  + / -               : Yakınlaştır / Uzaklaştır",
+		"  Enter veya c        : Seçili uçağı haritada ortala",
+		"  L                   : Canlı Takip Kilidi (Follow Mode) aç / kapat",
+		"  b / v / t / g       : Etiket modu / Hız vektörleri / İz modu / Radar halkaları",
+		"  T / i / p           : Tema değiştir / Canlı istatistikler / Animasyonu duraklat",
+		"  f / m / u / r       : Tam ekran / ASCII modu / Birimler (ft↔m) / Yenile",
+		"  /  |  a  |  M E s S : Ara | İrtifa filtresi | Askeri / Acil / Favori",
 		"  q veya Ctrl+C       : Çıkış",
-		"",
-		"  Renkler: Yeşil (<15k ft) | Mavi (15k-30k) | Mor (>30k) | Turuncu (Askeri) | Kırmızı (Acil) | Altın (Favori)",
 		"",
 		"  Kapatmak için ?, Esc veya Enter tuşuna basın.",
 	}, "\n")
 
 	box := lipgloss.NewStyle().
 		Border(border).
-		BorderForeground(lipgloss.Color("39")).
+		BorderForeground(theme.FocusBorder).
 		Padding(1, 3).
 		Render(helpText)
 

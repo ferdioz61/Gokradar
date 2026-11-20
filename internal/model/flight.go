@@ -6,10 +6,11 @@ import (
 	"time"
 )
 
-// Point represents a geographic coordinate.
+// Point represents a geographic coordinate with optional altitude for trail coloring.
 type Point struct {
-	Lat float64
-	Lon float64
+	Lat     float64
+	Lon     float64
+	AltFeet int
 }
 
 // Airport represents a major airport marker.
@@ -170,7 +171,34 @@ func FormatVertRate(fpm int, metric bool) string {
 
 // HeadingArrow returns a directional arrow (Unicode or ASCII) for a heading in degrees.
 func HeadingArrow(deg float64, ascii bool) string {
-	// Normalize to [0, 360)
+	idx := headingIndex(deg)
+	if ascii {
+		arrows := []string{"^", "/", ">", "\\", "v", "/", "<", "\\"}
+		return arrows[idx]
+	}
+	arrows := []string{"↑", "↗", "→", "↘", "↓", "↙", "←", "↖"}
+	return arrows[idx]
+}
+
+// HeadingSymbol returns a bold, crisp directional aircraft marker for the radar map.
+func HeadingSymbol(deg float64, ascii, onGround bool) string {
+	if onGround {
+		if ascii {
+			return "o"
+		}
+		return "▪"
+	}
+	idx := headingIndex(deg)
+	if ascii {
+		arrows := []string{"^", "/", ">", "\\", "v", "/", "<", "\\"}
+		return arrows[idx]
+	}
+	// Solid directional triangles stand out clearly over Braille coastlines/routes.
+	symbols := []string{"▲", "◥", "▶", "◢", "▼", "◣", "◀", "◤"}
+	return symbols[idx]
+}
+
+func headingIndex(deg float64) int {
 	d := deg
 	for d < 0 {
 		d += 360
@@ -178,11 +206,26 @@ func HeadingArrow(deg float64, ascii bool) string {
 	for d >= 360 {
 		d -= 360
 	}
-	idx := int((d+22.5)/45.0) % 8
-	if ascii {
-		arrows := []string{"^", "/", ">", "\\", "v", "/", "<", "\\"}
-		return arrows[idx]
+	return int((d+22.5)/45.0) % 8
+}
+
+// FormatATCAlt formats altitude compactly for map ATC data blocks (e.g. FL350, 8.2k, 10.7km).
+func FormatATCAlt(feet int, onGround, metric bool) string {
+	if onGround {
+		return "GND"
 	}
-	arrows := []string{"↑", "↗", "→", "↘", "↓", "↙", "←", "↖"}
-	return arrows[idx]
+	if feet <= 0 {
+		return ""
+	}
+	if metric {
+		m := float64(feet) * 0.3048
+		if m >= 1000 {
+			return fmt.Sprintf("%.1fkm", m/1000.0)
+		}
+		return fmt.Sprintf("%dm", int(m))
+	}
+	if feet >= 10000 {
+		return fmt.Sprintf("FL%03d", (feet+50)/100)
+	}
+	return fmt.Sprintf("%.1fk", float64(feet)/1000.0)
 }

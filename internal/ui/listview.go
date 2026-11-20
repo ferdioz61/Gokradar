@@ -11,13 +11,33 @@ import (
 )
 
 var (
-	listHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
-	listSelStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Background(lipgloss.Color("24")).Bold(true)
-	listEmergStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
-	listMilStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
-	listFavStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
-	listDimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	listEmergStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	listMilStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
+	listFavStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	listDimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
 )
+
+// ListScrollWindow returns the [start, end) slice bounds currently displayed in the flight list.
+func ListScrollWindow(total, cursor, rowsAvail int) (start, end int) {
+	if total <= 0 || rowsAvail <= 0 {
+		return 0, 0
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor >= total {
+		cursor = total - 1
+	}
+	start = 0
+	if cursor >= rowsAvail {
+		start = cursor - rowsAvail + 1
+	}
+	end = start + rowsAvail
+	if end > total {
+		end = total
+	}
+	return start, end
+}
 
 // RenderList renders the right-hand scrollable live flight table.
 func RenderList(
@@ -31,6 +51,7 @@ func RenderList(
 	searching bool,
 	searchQuery string,
 	filterTags string,
+	theme Theme,
 ) string {
 	if width < 16 || height < 4 {
 		return ""
@@ -40,15 +61,15 @@ func RenderList(
 
 	// Title / Search line
 	if searching {
-		lines = append(lines, listHeaderStyle.Render(truncate("ARA: "+searchQuery+"_", width)))
+		lines = append(lines, theme.ListHeader.Render(truncate("ARA: "+searchQuery+"_", width)))
 	} else if searchQuery != "" {
-		lines = append(lines, listHeaderStyle.Render(truncate(fmt.Sprintf("UÇUŞLAR (%d) /%s", len(flights), searchQuery), width)))
+		lines = append(lines, theme.ListHeader.Render(truncate(fmt.Sprintf("UÇUŞLAR (%d) /%s", len(flights), searchQuery), width)))
 	} else {
 		title := fmt.Sprintf("UÇUŞLAR (%d)", len(flights))
 		if filterTags != "" {
 			title += " " + filterTags
 		}
-		lines = append(lines, listHeaderStyle.Render(truncate(title, width)))
+		lines = append(lines, theme.ListHeader.Render(truncate(title, width)))
 	}
 
 	// Column header
@@ -71,21 +92,7 @@ func RenderList(
 		return strings.Join(lines, "\n")
 	}
 
-	if cursor < 0 {
-		cursor = 0
-	}
-	if cursor >= len(flights) {
-		cursor = len(flights) - 1
-	}
-
-	start := 0
-	if cursor >= rowsAvail {
-		start = cursor - rowsAvail + 1
-	}
-	end := start + rowsAvail
-	if end > len(flights) {
-		end = len(flights)
-	}
+	start, end := ListScrollWindow(len(flights), cursor, rowsAvail)
 
 	for i := start; i < end; i++ {
 		f := flights[i]
@@ -122,7 +129,7 @@ func RenderList(
 
 		switch {
 		case i == cursor:
-			lines = append(lines, listSelStyle.Render(row))
+			lines = append(lines, theme.ListSelected.Render(row))
 		case f.IsEmergency():
 			lines = append(lines, listEmergStyle.Render(row))
 		case f.IsMilitary:
