@@ -1,0 +1,42 @@
+GÖKRADAR — WINDOWS 10 POWERSHELL KULLANIM REHBERİ
+=================================================
+
+Ekstra hiçbir program veya kurulum gerekmez. Tek dosya (radar.exe) yeterlidir.
+
+1. BAŞLATMA
+-----------
+radar.exe dosyasını bir klasöre (örneğin Masaüstü\GokRadar) koyun.
+PowerShell'i o klasörde açın ve çalıştırın:
+
+    .\radar.exe
+
+Türkiye haritasıyla doğrudan başlamak için:
+
+    .\radar.exe --region tr
+
+Eğer klasik Windows 10 PowerShell'de harita çizgileri kutucuk (□) görünürse
+uygulama içindeyken 'm' tuşuna basabilir veya doğrudan ASCII modda açabilirsiniz:
+
+    .\radar.exe --ascii
+
+(İpucu: Microsoft Store'dan ücretsiz "Windows Terminal" kurulursa Braille harita
+çok daha keskin ve yüksek çözünürlüklü görünür.)
+
+2. TEMEL KISAYOLLAR
+-------------------
+  1 / 2 / 3 / 4 / 5  : Dünya / Türkiye / Avrupa / Orta Doğu / ABD
+  Tab                : Liste ve Harita odağı arasında geçiş
+  Ok tuşları         : Listede uçak seç / Haritada gezin
+  + / -              : Haritayı yakınlaştır / uzaklaştır
+  Enter veya c       : Seçili uçağı haritada ortala
+  f                  : Tam ekran harita
+  /                  : Uçuş ara (çağrı kodu, ülke, uçak tipi, havalimanı)
+  a                  : İrtifa filtresi
+  M                  : Sadece askeri uçuşlar
+  E                  : Sadece acil durum (7700 / 7600 / 7500)
+  s / S              : Favorilere ekle / Sadece favorileri göster
+  m                  : Braille <-> ASCII harita geçişi
+  u                  : ft/kt <-> m/km/s birim geçişi
+  r                  : Verileri yenile
+  ?                  : Tüm kısayollar
+  q                  : Çıkış

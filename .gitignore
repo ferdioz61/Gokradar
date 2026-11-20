@@ -1,0 +1,5 @@
+# Derlenmiş ikili dosyalar (GitHub Releases altında paylaşılır)
+dist/*.exe
+dist/radar*
+radar
+gokradar
