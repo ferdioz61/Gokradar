@@ -59,8 +59,10 @@ type tickMsg time.Time
 type animTickMsg time.Time
 
 type globalDataMsg struct {
-	flights []model.Flight
-	err     error
+	flights      []model.Flight
+	usedFallback bool
+	openSky429   bool
+	err          error
 }
 
 type regionalDataMsg struct {
@@ -133,13 +135,14 @@ type AppModel struct {
 	onlyFav     bool
 
 	// Status & async state
-	loadingGlobal bool
-	routeLoading  string
-	lastUpdate    time.Time
-	statusMsg     string
-	globalCount   int
-	milCount      int
-	sourceLabel   string
+	loadingGlobal      bool
+	openSkyCooldownEnd time.Time
+	routeLoading       string
+	lastUpdate         time.Time
+	statusMsg          string
+	globalCount        int
+	milCount           int
+	sourceLabel        string
 }
 
 // NewAppModel creates the initialized Bubble Tea model.
@@ -212,11 +215,27 @@ func animTickCmd() tea.Cmd {
 
 func (m AppModel) fetchGlobalCmd() tea.Cmd {
 	client := m.client
+	skipOpenSky := time.Now().Before(m.openSkyCooldownEnd)
 	return func() tea.Msg {
+		if !skipOpenSky {
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			fl, err := data.FetchOpenSkyGlobal(ctx, client)
+			cancel()
+			if err == nil && len(fl) > 0 {
+				return globalDataMsg{flights: fl}
+			}
+			is429 := err != nil && strings.Contains(err.Error(), "429")
+			// Automatic worldwide multi-hub fallback via adsb.lol + adsb.fi
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 18*time.Second)
+			defer cancel2()
+			fb, fbErr := data.FetchGlobalADSB(ctx2, client)
+			return globalDataMsg{flights: fb, usedFallback: true, openSky429: is429, err: fbErr}
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
 		defer cancel()
-		fl, err := data.FetchOpenSkyGlobal(ctx, client)
-		return globalDataMsg{flights: fl, err: err}
+		fb, err := data.FetchGlobalADSB(ctx, client)
+		return globalDataMsg{flights: fb, usedFallback: true, err: err}
 	}
 }
 
@@ -232,14 +251,28 @@ func (m AppModel) fetchMilCmd() tea.Cmd {
 
 func (m AppModel) fetchRegionalCmd() tea.Cmd {
 	client := m.client
-	lat, lon := m.vp.CenterLat, m.vp.CenterLon
-	if m.vp.SpanLon > 120 {
-		lat, lon = 39.0, 35.0
+	vp := m.vp
+	mapW, mapH, _ := m.mapDimensions()
+	// For very wide world view, global hub sweep handles everything; otherwise query viewport grid
+	if vp.SpanLon > 110 {
+		return nil
+	}
+	pts := [][2]float64{{vp.CenterLat, vp.CenterLon}}
+	if vp.SpanLon > 16 {
+		minLat, maxLat, minLon, maxLon := vp.Bounds(mapW, mapH)
+		dLat := (maxLat - minLat) * 0.25
+		dLon := (maxLon - minLon) * 0.25
+		pts = append(pts,
+			[2]float64{vp.CenterLat + dLat, vp.CenterLon - dLon},
+			[2]float64{vp.CenterLat + dLat, vp.CenterLon + dLon},
+			[2]float64{vp.CenterLat - dLat, vp.CenterLon - dLon},
+			[2]float64{vp.CenterLat - dLat, vp.CenterLon + dLon},
+		)
 	}
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
 		defer cancel()
-		fl, err := data.FetchADSBLolPoint(ctx, client, lat, lon, 250)
+		fl, err := data.FetchADSBLolMultiPoint(ctx, client, pts, 250)
 		return regionalDataMsg{flights: fl, err: err}
 	}
 }
@@ -285,13 +318,20 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case globalDataMsg:
 		m.loadingGlobal = false
+		if msg.openSky429 {
+			m.openSkyCooldownEnd = time.Now().Add(5 * time.Minute)
+		}
 		if msg.err != nil {
-			m.statusMsg = "OpenSky uyarısı: " + msg.err.Error() + " (bölgesel/askeri akış aktif)"
+			m.statusMsg = "Küresel veri uyarısı: " + msg.err.Error() + " (bölgesel/askeri akış aktif)"
 		} else {
 			m.mergeFlights(msg.flights, true)
 			m.globalCount = len(msg.flights)
 			m.lastUpdate = time.Now()
-			m.sourceLabel = "OpenSky+ADSB"
+			if msg.usedFallback {
+				m.sourceLabel = "ADSB.lol+fi Global"
+			} else {
+				m.sourceLabel = "OpenSky+ADSB"
+			}
 			m.statusMsg = fmt.Sprintf("Güncellendi (%s) — %d aktif uçak", m.lastUpdate.Format("15:04:05"), len(m.flightsByHex))
 		}
 		if m.followMode {
@@ -486,11 +526,16 @@ func (m AppModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	case msg.Button == tea.MouseButtonWheelUp:
 		if inMap {
 			m.focus = focusMap
-			cx := float64(msg.X - 1)
-			cy := float64(msg.Y - 2)
-			m.vp.ZoomAt(0.75, cx, cy, mapW, mapH)
+			if m.followMode && m.selectedHex != "" {
+				m.vp.Zoom(0.75)
+				m.syncFollowCamera()
+			} else {
+				cx := float64(msg.X - 1)
+				cy := float64(msg.Y - 2)
+				m.vp.ZoomAt(0.75, cx, cy, mapW, mapH)
+			}
 			m.rebuildFiltered()
-			if m.vp.SpanLon < 40 {
+			if m.vp.SpanLon < 90 {
 				return m, m.fetchRegionalCmd()
 			}
 			return m, nil
@@ -509,10 +554,18 @@ func (m AppModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	case msg.Button == tea.MouseButtonWheelDown:
 		if inMap {
 			m.focus = focusMap
-			cx := float64(msg.X - 1)
-			cy := float64(msg.Y - 2)
-			m.vp.ZoomAt(1.33, cx, cy, mapW, mapH)
+			if m.followMode && m.selectedHex != "" {
+				m.vp.Zoom(1.33)
+				m.syncFollowCamera()
+			} else {
+				cx := float64(msg.X - 1)
+				cy := float64(msg.Y - 2)
+				m.vp.ZoomAt(1.33, cx, cy, mapW, mapH)
+			}
 			m.rebuildFiltered()
+			if m.vp.SpanLon < 110 {
+				return m, m.fetchRegionalCmd()
+			}
 			return m, nil
 		}
 		if inList && len(m.filtered) > 0 {
@@ -767,16 +820,25 @@ func (m *AppModel) rebuildFiltered() {
 			}
 		}
 		if !found {
-			if m.cursor >= len(m.filtered) {
+			// Preserve user's selected aircraft as long as it still exists in flightsByHex
+			// (e.g. while zooming/panning to view its route). Only fall back if it truly disappeared.
+			if _, alive := m.flightsByHex[m.selectedHex]; !alive {
+				if m.cursor >= len(m.filtered) {
+					m.cursor = len(m.filtered) - 1
+				}
+				if m.cursor < 0 {
+					m.cursor = 0
+				}
+				if len(m.filtered) > 0 {
+					m.selectedHex = m.filtered[m.cursor].Hex
+				} else {
+					m.selectedHex = ""
+				}
+			} else if m.cursor >= len(m.filtered) {
 				m.cursor = len(m.filtered) - 1
-			}
-			if m.cursor < 0 {
-				m.cursor = 0
-			}
-			if len(m.filtered) > 0 {
-				m.selectedHex = m.filtered[m.cursor].Hex
-			} else {
-				m.selectedHex = ""
+				if m.cursor < 0 {
+					m.cursor = 0
+				}
 			}
 		}
 	} else if len(m.filtered) > 0 {
@@ -786,6 +848,11 @@ func (m *AppModel) rebuildFiltered() {
 }
 
 func (m *AppModel) selectedFlight() *model.Flight {
+	if m.selectedHex != "" {
+		if f, ok := m.flightsByHex[m.selectedHex]; ok {
+			return &f
+		}
+	}
 	if m.cursor >= 0 && m.cursor < len(m.filtered) {
 		return &m.filtered[m.cursor]
 	}
@@ -1158,6 +1225,7 @@ func (m AppModel) View() string {
 		m.world,
 		m.filtered,
 		m.selectedHex,
+		sel,
 		selRoute,
 		m.trails,
 		m.watchlist.Has,

@@ -79,7 +79,7 @@ func TestRenderMapAndStatsAllThemes(t *testing.T) {
 	allMap := map[string]model.Flight{"4b1800": flights[0], "4b1801": flights[1]}
 
 	for _, th := range Themes {
-		out := RenderMap(80, 24, vp, nil, flights, "4b1800", route, trails, func(_, _ string) bool { return false }, MapRenderOptions{
+		out := RenderMap(80, 24, vp, nil, flights, "4b1800", &flights[0], route, trails, func(_, _ string) bool { return false }, MapRenderOptions{
 			LabelMode:   LabelDetailed,
 			TrailMode:   TrailAll,
 			ShowRings:   true,
@@ -93,5 +93,26 @@ func TestRenderMapAndStatsAllThemes(t *testing.T) {
 		if !strings.Contains(stats, "CANLI TRAFİK İSTATİSTİKLERİ") {
 			t.Fatalf("theme %s: expected stats header", th.Name)
 		}
+	}
+}
+
+func TestSelectionPersistsWhenPannedOffscreen(t *testing.T) {
+	m := NewAppModel(nil, Options{Region: "tr"})
+	m.flightsByHex["sel01"] = model.Flight{Hex: "sel01", Callsign: "THY1831", Lat: 41.0, Lon: 29.0}
+	m.flightsByHex["other"] = model.Flight{Hex: "other", Callsign: "DLH99", Lat: 50.0, Lon: 8.5}
+	m.selectedHex = "sel01"
+	m.rebuildFiltered()
+
+	// Pan camera far away (to Europe) so sel01 is temporarily outside viewport
+	m.vp = geo.Presets[2].Viewport // AVRUPA (centered ~49, 11)
+	m.vp.SpanLon = 10.0            // tight zoom on Germany, excluding Istanbul
+	m.rebuildFiltered()
+
+	if m.selectedHex != "sel01" {
+		t.Fatalf("expected selectedHex to remain sel01 when panned offscreen, got %q", m.selectedHex)
+	}
+	sel := m.selectedFlight()
+	if sel == nil || sel.Hex != "sel01" {
+		t.Fatalf("expected selectedFlight() to still return sel01, got %+v", sel)
 	}
 }

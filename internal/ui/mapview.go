@@ -68,6 +68,7 @@ func RenderMap(
 	world *data.WorldData,
 	flights []model.Flight,
 	selectedHex string,
+	selectedFlight *model.Flight,
 	selectedRoute *model.RouteInfo,
 	trails map[string][]model.Point,
 	isFav func(callsign, hex string) bool,
@@ -116,12 +117,14 @@ func RenderMap(
 		}
 	}
 
-	// Locate selected flight
-	var selFlight *model.Flight
-	for i := range flights {
-		if flights[i].Hex == selectedHex {
-			selFlight = &flights[i]
-			break
+	// Locate selected flight (prefer explicit selectedFlight so route stays visible even when panned off-screen)
+	selFlight := selectedFlight
+	if selFlight == nil {
+		for i := range flights {
+			if flights[i].Hex == selectedHex {
+				selFlight = &flights[i]
+				break
+			}
 		}
 	}
 
