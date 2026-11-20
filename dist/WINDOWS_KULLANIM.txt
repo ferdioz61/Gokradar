@@ -1,26 +1,33 @@
-GÖKRADAR — WINDOWS 10 POWERSHELL KULLANIM REHBERİ
-=================================================
+GÖKRADAR — WINDOWS 10 / 11 KULLANIM REHBERİ
+===========================================
 
-Ekstra hiçbir program veya kurulum gerekmez. Tek dosya (radar.exe) yeterlidir.
+Ekstra hiçbir program veya kurulum gerekmez. Tek dosya yeterlidir.
+Hem Intel hem AMD işlemcilerde sorunsuz çalışır:
+- Çoğu bilgisayar için: radar-windows-64bit.exe
+- Çok eski 32-bit Windows 10 bilgisayarlar için: radar-windows-32bit.exe
 
 1. BAŞLATMA
 -----------
-radar.exe dosyasını bir klasöre (örneğin Masaüstü\GokRadar) koyun.
-PowerShell'i o klasörde açın ve çalıştırın:
+Windows 11 (Windows Terminal), Windows 10 (PowerShell veya CMD) ya da doğrudan
+.exe dosyasına çift tıklayarak çalıştırabilirsiniz.
 
-    .\radar.exe
+Terminal / PowerShell / CMD üzerinden çalıştırmak için:
+
+    .\radar-windows-64bit.exe
 
 Türkiye haritasıyla doğrudan başlamak için:
 
-    .\radar.exe --region tr
+    .\radar-windows-64bit.exe --region tr
 
-Eğer klasik Windows 10 PowerShell'de harita çizgileri kutucuk (□) görünürse
-uygulama içindeyken 'm' tuşuna basabilir veya doğrudan ASCII modda açabilirsiniz:
+NOT:
+- İlk açılışta Windows SmartScreen uyarısı çıkarsa "Ek bilgi -> Yine de çalıştır"
+  seçeneğini kullanabilirsiniz.
+- Windows 11'de yerleşik Windows Terminal ile yüksek çözünürlüklü Braille harita
+  doğrudan keskin görünür.
+- Eski Windows 10 PowerShell/CMD penceresinde harita çizgileri kutucuk (□)
+  görünürse uygulama içindeyken 'm' tuşuna basabilir veya --ascii ile açabilirsiniz:
 
-    .\radar.exe --ascii
-
-(İpucu: Microsoft Store'dan ücretsiz "Windows Terminal" kurulursa Braille harita
-çok daha keskin ve yüksek çözünürlüklü görünür.)
+    .\radar-windows-64bit.exe --ascii
 
 2. TEMEL KISAYOLLAR
 -------------------
